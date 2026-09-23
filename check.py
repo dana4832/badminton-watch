@@ -11,6 +11,7 @@
   FORCE_NOTIFY        "1"이면 변화가 없어도 현재 상태를 보낸다 (테스트용)
   DUMP_HTML           "1"이면 받은 HTML을 page.html로 저장한다 (디버그용)
 """
+import html as html_mod
 import json
 import os
 import re
@@ -193,11 +194,41 @@ def has_rows(html: str) -> bool:
     return any(not r.select_one("td.empty, .nodata_wrap") for r in rows)
 
 
+def list_course_names(html: str) -> list:
+    """목록 표의 각 행에서 강좌명(3번째 칸)을 뽑는다. 진단용."""
+    soup = BeautifulSoup(html, "html.parser")
+    names = []
+    for r in soup.select(".modules_fmcs_lecture tbody tr") or soup.select("tbody tr"):
+        if r.select_one("td.empty, .nodata_wrap"):
+            continue
+        tds = r.find_all("td")
+        if len(tds) >= 3:
+            names.append(normalize(tds[2].get_text(" ")))
+        elif tds:
+            names.append(normalize(r.get_text(" "))[:40])
+    return names
+
+
+SEEN = {}  # 탭이름 -> 그 탭에서 본 강좌명 목록 (진단용)
+
+
+def seen_summary() -> str:
+    parts = []
+    for tab_name, names in SEEN.items():
+        if names:
+            shown = html_mod.escape(", ".join(names[:6])) + (f" 외 {len(names) - 6}개" if len(names) > 6 else "")
+            parts.append(f"{tab_name} 탭 {len(names)}개: {shown}")
+        else:
+            parts.append(f"{tab_name} 탭: 강좌 없음")
+    return "\n".join(parts)
+
+
 def find_status_all_tabs():
     """두 탭(신규접수→접수종료)을 페이지별로 훑어 대상 강좌의 상태를 찾는다.
     반환: (상태, 탭이름, 행텍스트) 또는 (None, None, 이유)."""
     last_reason = "목록을 읽지 못했습니다."
     for code, tab_name in LECTURE_TABS:
+        SEEN[tab_name] = []
         prev_html = None
         for page in range(1, MAX_PAGES + 1):
             url = build_url(code, page)
@@ -210,6 +241,7 @@ def find_status_all_tabs():
                 print(f"[{tab_name} 탭 {page}페이지] 이전 페이지와 동일, 중단")
                 break
             prev_html = html
+            SEEN[tab_name].extend(list_course_names(html))
             status, detail = find_status(html)
             if status:
                 return status, tab_name, detail
@@ -273,10 +305,13 @@ def main() -> int:
 
     print(f"[{now_kst()}] status={status!r} tab={tab_name!r} detail={detail[:200]!r}")
 
+    extra_lines = []
     if status is None:
         # 두 탭 모두에 강좌가 없음: 강좌가 목록에서 내려간 상태로 취급하고 변화 시에만 알림
         status = "목록에 없음"
         tab_name = "-"
+        extra_lines.append("🔎 현재 보이는 강좌:\n" + seen_summary())
+        print(seen_summary())
 
     is_open = bool(OPEN_PATTERN.search(status))
     changed = status != prev_status
@@ -293,6 +328,7 @@ def main() -> int:
             f"강좌: {TARGET_KEYWORD} (월수금 20:30~21:50)",
             f"상태: <b>{status}</b>" + (f" (이전: {prev_status})" if prev_status and changed else "") + f" · {tab_name} 탭",
             f"시간: {now_kst()}",
+            *extra_lines,
             f'<a href="{TARGET_URL}">👉 예약 페이지 열기</a>',
         ]
         send_telegram("\n".join(lines))
