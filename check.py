@@ -50,7 +50,11 @@ STATUS_PATTERN = re.compile(
     r"(접수하기|접수\s*중|접수\s*대기|대기\s*접수|접수\s*예정|접수\s*종료|접수\s*마감|마감|정원\s*초과|신청하기|예약하기)"
 )
 # 이 문구가 나오면 "접수 가능"으로 본다.
-OPEN_PATTERN = re.compile(r"(접수하기|접수\s*중|신청하기|예약하기)")
+OPEN_PATTERN = re.compile(r"(수강\s*신청|접수하기|접수\s*중|신청하기|예약하기)")
+# 상세 페이지의 신청 버튼 문구 (버튼 전체 글자가 이 중 하나와 일치해야 함. "목록으로" 등은 제외)
+APPLY_BUTTON_PATTERN = re.compile(
+    r"^(수강\s*신청(하기)?|접수\s*하기|신청\s*하기|예약\s*하기|접수\s*중|신청|접수|대기\s*신청|접수\s*대기)$"
+)
 # 목록 탭: R=신규접수, E=접수종료
 LECTURE_TABS = (("R", "신규접수"), ("E", "접수종료"))
 
@@ -99,28 +103,32 @@ def find_status_in_list(html: str):
 
 
 def find_status_in_detail(html: str):
-    """상세 페이지에서 신청 버튼 상태를 읽는다. (상태문구, 설명) 또는 (None, 이유)."""
+    """상세 페이지에서 접수 상태를 판정한다. (상태문구, 설명) 또는 (None, 이유).
+
+    이 사이트는 접수 가능하면 '목록으로'와 '수강신청' 두 버튼이 있고,
+    마감되면 '수강신청' 버튼이 사라지고 정원/신청인원 표에 '마감'이 표시된다.
+    따라서 신청 버튼의 존재 여부로 판정하고, 표의 문구는 보조로 쓴다."""
     main = content_soup(html)
     text = normalize(main.get_text(" "))
     if TARGET_KEYWORD not in text:
         return None, f"상세 페이지에 '{TARGET_KEYWORD}' 문구가 없습니다. 본문: {text[:150]}"
-    # 버튼류 우선(btn 클래스가 있는 것부터), 그다음 일반 링크/스팬
-    candidates = []
-    for el in main.select("button, a, input[type=button], input[type=submit], span, em, strong"):
+
+    buttons = []
+    for el in main.select("button, a, input[type=button], input[type=submit]"):
         label = normalize(el.get_text(" ")) or normalize(el.get("value", ""))
-        m = STATUS_PATTERN.search(label)
-        if not m:
-            continue
-        cls = " ".join(el.get("class", []))
-        score = 2 if ("btn" in cls or el.name in ("button", "input")) else 1
-        candidates.append((score, normalize(m.group(1)), label))
-    if candidates:
-        candidates.sort(key=lambda c: -c[0])
-        return candidates[0][1], f"버튼 문구: {candidates[0][2]}"
-    m = STATUS_PATTERN.findall(text)
+        if label:
+            buttons.append(label)
+    apply_buttons = [b for b in buttons if APPLY_BUTTON_PATTERN.match(b)]
+    if apply_buttons:
+        return apply_buttons[0], f"신청 버튼 있음: {apply_buttons[0]} (버튼 목록: {', '.join(buttons)})"
+
+    # 신청 버튼이 없음 → 마감. 표에 적힌 문구가 있으면 그것을 상태로 쓴다.
+    m = re.search(r"(접수\s*종료|접수\s*마감|마감|정원\s*초과|접수\s*대기|접수\s*예정)", text)
     if m:
-        return normalize(m[-1]), "본문 텍스트에서 상태 문구 발견"
-    return None, f"상세 페이지에 상태 버튼이 없습니다. 본문: {text[:150]}"
+        return normalize(m.group(1)), f"신청 버튼 없음, 표 문구: {m.group(1)} (버튼 목록: {', '.join(buttons) or '없음'})"
+    if buttons:
+        return "신청 버튼 없음", f"버튼 목록: {', '.join(buttons)}"
+    return None, f"상세 페이지에 버튼이 하나도 없습니다. 본문: {text[:150]}"
 
 
 def list_course_names(html: str) -> list:
