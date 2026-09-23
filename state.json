@@ -1,4 +1,4 @@
 {
-  "error": "페이지를 가져오지 못했습니다: HTTPSConnectionPool(host='yssports.yong-san.or.kr', port=443): Max retries exceeded with url: /fmcs/2?center=YGSN01&event=1010000000&class=1010010000&subject= (Caused by SSLError(SSLCertVerificationError(1, '[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate (_ssl.c:1010)')))",
-  "checked_at": "2026-09-23 10:44:16 KST"
+  "error": "페이지에 '배드민턴 20:30' 문구가 없습니다.",
+  "checked_at": "2026-09-23 10:50:43 KST"
 }
