@@ -1,0 +1,68 @@
+name: 배드민턴 접수 감시
+
+on:
+  schedule:
+    # GitHub Actions 최소 간격은 5분. 실제 실행은 몇 분 늦어질 수 있음.
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      force_notify:
+        description: "변화가 없어도 현재 상태를 텔레그램으로 보내기 (테스트)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: badminton-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: 상태 확인
+        id: check
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TARGET_KEYWORD: ${{ vars.TARGET_KEYWORD || '배드민턴 20:30' }}
+          FORCE_NOTIFY: ${{ github.event_name == 'workflow_dispatch' && inputs.force_notify && '1' || '0' }}
+          DUMP_HTML: "1"
+        run: python check.py
+
+      - name: 디버그용 HTML 저장 (실패 시)
+        if: steps.check.outcome != 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: page-html-${{ github.run_id }}
+          path: page.html
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: 상태 파일 커밋
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet -- state.json; then
+            git add state.json
+            git commit -m "state: $(python -c 'import json;print(json.load(open("state.json")).get("status") or json.load(open("state.json")).get("error","?"))') [skip ci]"
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
+            git push
+          fi
+
+      - name: 결과 반영
+        if: steps.check.outcome != 'success'
+        run: exit 1
