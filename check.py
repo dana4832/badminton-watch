@@ -14,9 +14,12 @@
 import json
 import os
 import re
+import ssl
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -50,15 +53,81 @@ def now_kst() -> str:
     return datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")
 
 
-def fetch_html() -> str:
-    last_err = None
-    for attempt in range(3):
+def complete_ca_bundle() -> str:
+    """사이트가 중간 인증서를 보내지 않을 때, 서버 인증서에 적힌 발급기관(AIA) 주소에서
+    중간 인증서를 내려받아 certifi 기본 신뢰 목록에 덧붙인 번들 파일을 만든다.
+    브라우저가 하는 'AIA fetching'과 같은 동작이며, 인증서 검증은 그대로 유지된다."""
+    import certifi
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.x509.oid import AuthorityInformationAccessOID
+
+    parsed = urlparse(TARGET_URL)
+    # 서버가 제시하는 인증서(공개 정보)를 읽어 발급기관 주소를 찾는다.
+    leaf_pem = ssl.get_server_certificate((parsed.hostname, parsed.port or 443))
+    cert = x509.load_pem_x509_certificate(leaf_pem.encode())
+
+    extra = []
+    for _ in range(4):  # 중간 인증서가 여러 단계일 수 있음
+        if cert.issuer == cert.subject:
+            break  # 루트 인증서에 도달
         try:
-            resp = requests.get(TARGET_URL, headers=HEADERS, timeout=30)
+            aia = cert.extensions.get_extension_for_class(x509.AuthorityInformationAccess).value
+        except x509.ExtensionNotFound:
+            break
+        urls = [
+            d.access_location.value
+            for d in aia
+            if d.access_method == AuthorityInformationAccessOID.CA_ISSUERS
+        ]
+        if not urls:
+            break
+        r = requests.get(urls[0], timeout=30)
+        r.raise_for_status()
+        data = r.content
+        try:
+            issuer = x509.load_der_x509_certificate(data)
+        except ValueError:
+            issuer = x509.load_pem_x509_certificate(data)
+        extra.append(issuer.public_bytes(serialization.Encoding.PEM).decode())
+        print(f"중간 인증서 확보: {issuer.subject.rfc4514_string()} <- {urls[0]}")
+        cert = issuer
+
+    if not extra:
+        raise RuntimeError("발급기관 주소(AIA)에서 중간 인증서를 찾지 못했습니다.")
+
+    bundle_path = os.path.join(tempfile.gettempdir(), "ca_bundle_with_intermediates.pem")
+    with open(certifi.where(), encoding="utf-8") as src, open(bundle_path, "w", encoding="utf-8") as dst:
+        dst.write(src.read())
+        dst.write("\n")
+        dst.write("\n".join(extra))
+    return bundle_path
+
+
+def fetch_html() -> str:
+    """페이지 HTML을 가져온다. 인증서 체인이 불완전하면 중간 인증서를 보충해 다시 검증한다."""
+    last_err = None
+    verify = True
+    tried_bundle = False
+    for attempt in range(4):
+        try:
+            resp = requests.get(TARGET_URL, headers=HEADERS, timeout=30, verify=verify)
             resp.raise_for_status()
             if not resp.encoding or resp.encoding.lower() == "iso-8859-1":
                 resp.encoding = resp.apparent_encoding or "utf-8"
             return resp.text
+        except requests.exceptions.SSLError as e:
+            last_err = e
+            if not tried_bundle:
+                tried_bundle = True
+                print(f"인증서 검증 실패, 중간 인증서를 보충합니다: {e}")
+                try:
+                    verify = complete_ca_bundle()
+                    continue
+                except Exception as e2:  # noqa: BLE001
+                    last_err = RuntimeError(f"{e}; 중간 인증서 보충 실패: {e2}")
+                    break
+            time.sleep(5 * (attempt + 1))
         except Exception as e:  # noqa: BLE001
             last_err = e
             time.sleep(5 * (attempt + 1))
