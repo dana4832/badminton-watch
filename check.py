@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -104,14 +104,15 @@ def complete_ca_bundle() -> str:
     return bundle_path
 
 
-def fetch_html() -> str:
+def fetch_html(url: str = None) -> str:
     """페이지 HTML을 가져온다. 인증서 체인이 불완전하면 중간 인증서를 보충해 다시 검증한다."""
+    url = url or TARGET_URL
     last_err = None
     verify = True
     tried_bundle = False
     for attempt in range(4):
         try:
-            resp = requests.get(TARGET_URL, headers=HEADERS, timeout=30, verify=verify)
+            resp = requests.get(url, headers=HEADERS, timeout=30, verify=verify)
             resp.raise_for_status()
             if not resp.encoding or resp.encoding.lower() == "iso-8859-1":
                 resp.encoding = resp.apparent_encoding or "utf-8"
@@ -172,6 +173,54 @@ def find_status(html: str):
     return None, f"페이지에 '{TARGET_KEYWORD}' 문구가 없습니다."
 
 
+# 목록 탭: R=신규접수, E=접수종료. 접수가 열리면 강좌가 R 탭으로 옮겨간다.
+LECTURE_TABS = (("R", "신규접수"), ("E", "접수종료"))
+MAX_PAGES = int(os.environ.get("MAX_PAGES", "5"))
+
+
+def build_url(lecture_type: str, page: int) -> str:
+    parsed = urlparse(TARGET_URL)
+    params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    params["lecture_type"] = lecture_type
+    params["page"] = str(page)
+    return urlunparse(parsed._replace(query=urlencode(params, encoding="utf-8")))
+
+
+def has_rows(html: str) -> bool:
+    """목록 표에 실제 강좌 행이 있는지(빈 목록 안내 행 제외)."""
+    soup = BeautifulSoup(html, "html.parser")
+    rows = soup.select(".modules_fmcs_lecture tbody tr") or soup.select("tbody tr")
+    return any(not r.select_one("td.empty, .nodata_wrap") for r in rows)
+
+
+def find_status_all_tabs():
+    """두 탭(신규접수→접수종료)을 페이지별로 훑어 대상 강좌의 상태를 찾는다.
+    반환: (상태, 탭이름, 행텍스트) 또는 (None, None, 이유)."""
+    last_reason = "목록을 읽지 못했습니다."
+    for code, tab_name in LECTURE_TABS:
+        prev_html = None
+        for page in range(1, MAX_PAGES + 1):
+            url = build_url(code, page)
+            html = fetch_html(url)
+            if DUMP_HTML:
+                for name in (f"page_{code}_{page}.html", "page.html"):
+                    with open(name, "w", encoding="utf-8") as f:
+                        f.write(html)
+            if html == prev_html:
+                print(f"[{tab_name} 탭 {page}페이지] 이전 페이지와 동일, 중단")
+                break
+            prev_html = html
+            status, detail = find_status(html)
+            if status:
+                return status, tab_name, detail
+            if not has_rows(html):
+                print(f"[{tab_name} 탭 {page}페이지] 강좌 행 없음")
+                break
+            print(f"[{tab_name} 탭 {page}페이지] 강좌 있음, 대상 없음")
+            last_reason = detail
+    return None, None, "신규접수/접수종료 탭 어디에도 대상 강좌가 없습니다. " + last_reason
+
+
 def send_telegram(message: str) -> None:
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     chat_id = os.environ["TELEGRAM_CHAT_ID"]
@@ -211,7 +260,7 @@ def main() -> int:
     prev_error = state.get("error")
 
     try:
-        html = fetch_html()
+        status, tab_name, detail = find_status_all_tabs()
     except Exception as e:  # noqa: BLE001
         msg = str(e)
         print(msg, file=sys.stderr)
@@ -222,23 +271,12 @@ def main() -> int:
             save_state(state)
         return 1
 
-    if DUMP_HTML:
-        with open("page.html", "w", encoding="utf-8") as f:
-            f.write(html)
-
-    status, detail = find_status(html)
-    print(f"[{now_kst()}] status={status!r} detail={detail[:200]!r}")
+    print(f"[{now_kst()}] status={status!r} tab={tab_name!r} detail={detail[:200]!r}")
 
     if status is None:
-        # 구조 해석 실패: 처음 한 번만 알림
-        if prev_error != detail or FORCE_NOTIFY:
-            send_telegram(
-                f"⚠️ 배드민턴 감시: 강좌 상태를 읽지 못했습니다.\n{detail}\n"
-                f"GitHub Actions 로그와 page.html 아티팩트를 확인해 주세요.\n{now_kst()}"
-            )
-        state.update({"error": detail, "checked_at": now_kst()})
-        save_state(state)
-        return 1
+        # 두 탭 모두에 강좌가 없음: 강좌가 목록에서 내려간 상태로 취급하고 변화 시에만 알림
+        status = "목록에 없음"
+        tab_name = "-"
 
     is_open = bool(OPEN_PATTERN.search(status))
     changed = status != prev_status
@@ -253,7 +291,7 @@ def main() -> int:
         lines = [
             head,
             f"강좌: {TARGET_KEYWORD} (월수금 20:30~21:50)",
-            f"상태: <b>{status}</b>" + (f" (이전: {prev_status})" if prev_status and changed else ""),
+            f"상태: <b>{status}</b>" + (f" (이전: {prev_status})" if prev_status and changed else "") + f" · {tab_name} 탭",
             f"시간: {now_kst()}",
             f'<a href="{TARGET_URL}">👉 예약 페이지 열기</a>',
         ]
