@@ -21,7 +21,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -32,6 +32,21 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      - name: 크롬 브라우저 캐시
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: 크롬 브라우저 설치
+        run: |
+          if [ "${{ steps.pw-cache.outputs.cache-hit }}" = "true" ]; then
+            python -m playwright install-deps chromium
+          else
+            python -m playwright install --with-deps chromium
+          fi
+
       - name: 상태 확인
         id: check
         continue-on-error: true
@@ -39,18 +54,19 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TARGET_KEYWORD: ${{ vars.TARGET_KEYWORD || '배드민턴 20:30' }}
+          DETAIL_URL: ${{ vars.DETAIL_URL }}
           FORCE_NOTIFY: ${{ github.event_name == 'workflow_dispatch' && inputs.force_notify && '1' || '0' }}
           DUMP_HTML: "1"
         run: python check.py
 
-      - name: 디버그용 HTML 저장
+      - name: 디버그용 화면 저장
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: page-html-${{ github.run_id }}
+          name: pages-${{ github.run_id }}
           path: |
-            page.html
             page_*.html
+            shot_*.png
           if-no-files-found: ignore
           retention-days: 1
 
@@ -60,7 +76,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           if ! git diff --quiet -- state.json; then
             git add state.json
-            git commit -m "state: $(python -c 'import json;print(json.load(open("state.json")).get("status") or json.load(open("state.json")).get("error","?"))') [skip ci]"
+            git commit -m "state: $(python -c 'import json;d=json.load(open("state.json"));print(d.get("status") or d.get("error","?"))') [skip ci]"
             git pull --rebase origin "${GITHUB_REF_NAME}" || true
             git push
           fi

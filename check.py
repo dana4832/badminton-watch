@@ -2,203 +2,132 @@
 """용산구 공공체육시설 수강신청 페이지에서 특정 강좌의 접수 버튼 상태를 확인하고,
 상태가 바뀌면 텔레그램으로 알림을 보낸다.
 
+목록이 자바스크립트/세션에 의존해 채워지므로 실제 크롬(헤드리스)으로 페이지를 열어 읽는다.
+1) 강좌 상세 페이지(DETAIL_URL)의 버튼을 먼저 읽고,
+2) 못 읽으면 목록 페이지(TARGET_URL)의 신규접수/접수종료 탭에서 강좌 행을 찾는다.
+
 환경 변수
   TELEGRAM_BOT_TOKEN  텔레그램 봇 토큰 (필수)
   TELEGRAM_CHAT_ID    알림을 받을 채팅 ID (필수)
-  TARGET_URL          감시할 페이지 URL
+  DETAIL_URL          강좌 상세 페이지 URL
+  TARGET_URL          강좌 목록 페이지 URL
   TARGET_KEYWORD      강좌 행을 찾는 키워드 (기본: "배드민턴 20:30")
   STATE_FILE          마지막 상태를 저장하는 파일 (기본: state.json)
   FORCE_NOTIFY        "1"이면 변화가 없어도 현재 상태를 보낸다 (테스트용)
-  DUMP_HTML           "1"이면 받은 HTML을 page.html로 저장한다 (디버그용)
+  DUMP_HTML           "1"이면 읽은 페이지를 page_*.html / shot_*.png 로 저장한다 (디버그용)
 """
 import html as html_mod
 import json
 import os
 import re
-import ssl
 import sys
-import tempfile
 import time
 from datetime import datetime, timedelta, timezone
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
 
-TARGET_URL = os.environ.get(
-    "TARGET_URL",
-    "https://yssports.yong-san.or.kr/fmcs/2?center=YGSN01&event=1010000000&class=1010010000&subject=",
+DETAIL_URL = os.environ.get("DETAIL_URL") or (
+    "https://yssports.yong-san.or.kr/fmcs/8?center=YGSN01&action=read&page=1"
+    "&event=1010000000&class=1010010000&comcd=YGSN01&classcd=00147&type=R"
 )
-TARGET_KEYWORD = os.environ.get("TARGET_KEYWORD", "배드민턴 20:30")
+TARGET_URL = os.environ.get("TARGET_URL") or (
+    "https://yssports.yong-san.or.kr/fmcs/2?center=YGSN01&event=1010000000&class=1010010000&subject="
+)
+TARGET_KEYWORD = os.environ.get("TARGET_KEYWORD") or "배드민턴 20:30"
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 FORCE_NOTIFY = os.environ.get("FORCE_NOTIFY") == "1"
 DUMP_HTML = os.environ.get("DUMP_HTML") == "1"
+PAGE_TIMEOUT_MS = int(os.environ.get("PAGE_TIMEOUT_MS", "60000"))
 
 KST = timezone(timedelta(hours=9))
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/128.0 Safari/537.36"
-    ),
-    "Accept-Language": "ko-KR,ko;q=0.9",
-}
+USER_AGENT = (
+    "Mozilla/5.0 (Linux; Android 14; SM-S921N) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
+)
 # 버튼에 나올 수 있는 상태 문구. 앞에 있는 것이 우선 매칭된다.
 STATUS_PATTERN = re.compile(
     r"(접수하기|접수\s*중|접수\s*대기|대기\s*접수|접수\s*예정|접수\s*종료|접수\s*마감|마감|정원\s*초과|신청하기|예약하기)"
 )
 # 이 문구가 나오면 "접수 가능"으로 본다.
 OPEN_PATTERN = re.compile(r"(접수하기|접수\s*중|신청하기|예약하기)")
+# 목록 탭: R=신규접수, E=접수종료
+LECTURE_TABS = (("R", "신규접수"), ("E", "접수종료"))
+
+SEEN = {}  # 진단용: 화면 이름 -> 그 화면에서 본 강좌명/요약
 
 
 def now_kst() -> str:
     return datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")
 
 
-def complete_ca_bundle() -> str:
-    """사이트가 중간 인증서를 보내지 않을 때, 서버 인증서에 적힌 발급기관(AIA) 주소에서
-    중간 인증서를 내려받아 certifi 기본 신뢰 목록에 덧붙인 번들 파일을 만든다.
-    브라우저가 하는 'AIA fetching'과 같은 동작이며, 인증서 검증은 그대로 유지된다."""
-    import certifi
-    from cryptography import x509
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.x509.oid import AuthorityInformationAccessOID
-
-    parsed = urlparse(TARGET_URL)
-    # 서버가 제시하는 인증서(공개 정보)를 읽어 발급기관 주소를 찾는다.
-    leaf_pem = ssl.get_server_certificate((parsed.hostname, parsed.port or 443))
-    cert = x509.load_pem_x509_certificate(leaf_pem.encode())
-
-    extra = []
-    for _ in range(4):  # 중간 인증서가 여러 단계일 수 있음
-        if cert.issuer == cert.subject:
-            break  # 루트 인증서에 도달
-        try:
-            aia = cert.extensions.get_extension_for_class(x509.AuthorityInformationAccess).value
-        except x509.ExtensionNotFound:
-            break
-        urls = [
-            d.access_location.value
-            for d in aia
-            if d.access_method == AuthorityInformationAccessOID.CA_ISSUERS
-        ]
-        if not urls:
-            break
-        r = requests.get(urls[0], timeout=30)
-        r.raise_for_status()
-        data = r.content
-        try:
-            issuer = x509.load_der_x509_certificate(data)
-        except ValueError:
-            issuer = x509.load_pem_x509_certificate(data)
-        extra.append(issuer.public_bytes(serialization.Encoding.PEM).decode())
-        print(f"중간 인증서 확보: {issuer.subject.rfc4514_string()} <- {urls[0]}")
-        cert = issuer
-
-    if not extra:
-        raise RuntimeError("발급기관 주소(AIA)에서 중간 인증서를 찾지 못했습니다.")
-
-    bundle_path = os.path.join(tempfile.gettempdir(), "ca_bundle_with_intermediates.pem")
-    with open(certifi.where(), encoding="utf-8") as src, open(bundle_path, "w", encoding="utf-8") as dst:
-        dst.write(src.read())
-        dst.write("\n")
-        dst.write("\n".join(extra))
-    return bundle_path
-
-
-def fetch_html(url: str = None) -> str:
-    """페이지 HTML을 가져온다. 인증서 체인이 불완전하면 중간 인증서를 보충해 다시 검증한다."""
-    url = url or TARGET_URL
-    last_err = None
-    verify = True
-    tried_bundle = False
-    for attempt in range(4):
-        try:
-            resp = requests.get(url, headers=HEADERS, timeout=30, verify=verify)
-            resp.raise_for_status()
-            if not resp.encoding or resp.encoding.lower() == "iso-8859-1":
-                resp.encoding = resp.apparent_encoding or "utf-8"
-            return resp.text
-        except requests.exceptions.SSLError as e:
-            last_err = e
-            if not tried_bundle:
-                tried_bundle = True
-                print(f"인증서 검증 실패, 중간 인증서를 보충합니다: {e}")
-                try:
-                    verify = complete_ca_bundle()
-                    continue
-                except Exception as e2:  # noqa: BLE001
-                    last_err = RuntimeError(f"{e}; 중간 인증서 보충 실패: {e2}")
-                    break
-            time.sleep(5 * (attempt + 1))
-        except Exception as e:  # noqa: BLE001
-            last_err = e
-            time.sleep(5 * (attempt + 1))
-    raise RuntimeError(f"페이지를 가져오지 못했습니다: {last_err}")
-
-
 def normalize(text: str) -> str:
-    return re.sub(r"\s+", " ", text or "").strip()
+    return re.sub(r"\s+", " ", (text or "").replace("\xa0", " ")).strip()
 
 
-def find_status(html: str):
-    """대상 강좌 행을 찾아 (상태문구, 행 텍스트)를 돌려준다. 못 찾으면 (None, 이유)."""
+# ---------- HTML 해석 ----------
+
+def content_soup(html: str) -> BeautifulSoup:
+    """본문(강좌 모듈) 부분만 남긴 soup. 메뉴/탭/푸터의 '접수종료' 같은 글자를 제거한다."""
     soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "noscript"]):
+    for tag in soup(["script", "style", "noscript", "header", "footer"]):
         tag.decompose()
+    for sel in (".list_tab", "#menu_topmenu", "#gnb-m", ".breadcrumb", ".footer", ".header"):
+        for t in soup.select(sel):
+            t.decompose()
+    main = soup.select_one(".modules_fmcs_lecture") or soup.select_one("#contents") or soup
+    return main
 
-    # 1) 표 형태(tr), 목록 형태(li), 그 외 div 순으로 "행" 후보를 찾는다.
+
+def find_status_in_list(html: str):
+    """목록 표에서 대상 강좌 행을 찾아 (상태문구, 행 텍스트)를 돌려준다. 못 찾으면 (None, 이유)."""
+    main = content_soup(html)
     for selector in ("tr", "li", "div"):
-        for row in soup.select(selector):
+        for row in main.select(selector):
             text = normalize(row.get_text(" "))
-            if TARGET_KEYWORD not in text:
+            if TARGET_KEYWORD not in text or text.count(TARGET_KEYWORD) > 1:
                 continue
-            # 행 안에 키워드가 여러 번 나오면(상위 컨테이너) 더 작은 행을 찾기 위해 건너뛴다.
-            if text.count(TARGET_KEYWORD) > 1:
-                continue
-            # 버튼/링크 요소를 우선 확인
             for el in row.select("button, a, span, input"):
                 label = normalize(el.get_text(" ")) or normalize(el.get("value", ""))
                 m = STATUS_PATTERN.search(label)
                 if m:
                     return normalize(m.group(1)), text
-            # 버튼 요소가 없으면 행 텍스트 전체에서 상태 문구를 찾는다(마지막 것 사용).
             matches = STATUS_PATTERN.findall(text)
             if matches:
                 return normalize(matches[-1]), text
-
-    page_text = normalize(soup.get_text(" "))
-    if TARGET_KEYWORD in page_text:
-        return None, "키워드는 있지만 행/버튼 구조를 해석하지 못했습니다."
-    if "접수" not in page_text and "강좌" not in page_text:
-        return None, "강좌 목록이 HTML에 없습니다(자바스크립트로 로드되는 페이지일 수 있음)."
-    return None, f"페이지에 '{TARGET_KEYWORD}' 문구가 없습니다."
+    return None, f"목록에 '{TARGET_KEYWORD}' 행이 없습니다."
 
 
-# 목록 탭: R=신규접수, E=접수종료. 접수가 열리면 강좌가 R 탭으로 옮겨간다.
-LECTURE_TABS = (("R", "신규접수"), ("E", "접수종료"))
-MAX_PAGES = int(os.environ.get("MAX_PAGES", "5"))
-
-
-def build_url(lecture_type: str, page: int) -> str:
-    parsed = urlparse(TARGET_URL)
-    params = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    params["lecture_type"] = lecture_type
-    params["page"] = str(page)
-    return urlunparse(parsed._replace(query=urlencode(params, encoding="utf-8")))
-
-
-def has_rows(html: str) -> bool:
-    """목록 표에 실제 강좌 행이 있는지(빈 목록 안내 행 제외)."""
-    soup = BeautifulSoup(html, "html.parser")
-    rows = soup.select(".modules_fmcs_lecture tbody tr") or soup.select("tbody tr")
-    return any(not r.select_one("td.empty, .nodata_wrap") for r in rows)
+def find_status_in_detail(html: str):
+    """상세 페이지에서 신청 버튼 상태를 읽는다. (상태문구, 설명) 또는 (None, 이유)."""
+    main = content_soup(html)
+    text = normalize(main.get_text(" "))
+    if TARGET_KEYWORD not in text:
+        return None, f"상세 페이지에 '{TARGET_KEYWORD}' 문구가 없습니다. 본문: {text[:150]}"
+    # 버튼류 우선(btn 클래스가 있는 것부터), 그다음 일반 링크/스팬
+    candidates = []
+    for el in main.select("button, a, input[type=button], input[type=submit], span, em, strong"):
+        label = normalize(el.get_text(" ")) or normalize(el.get("value", ""))
+        m = STATUS_PATTERN.search(label)
+        if not m:
+            continue
+        cls = " ".join(el.get("class", []))
+        score = 2 if ("btn" in cls or el.name in ("button", "input")) else 1
+        candidates.append((score, normalize(m.group(1)), label))
+    if candidates:
+        candidates.sort(key=lambda c: -c[0])
+        return candidates[0][1], f"버튼 문구: {candidates[0][2]}"
+    m = STATUS_PATTERN.findall(text)
+    if m:
+        return normalize(m[-1]), "본문 텍스트에서 상태 문구 발견"
+    return None, f"상세 페이지에 상태 버튼이 없습니다. 본문: {text[:150]}"
 
 
 def list_course_names(html: str) -> list:
     """목록 표의 각 행에서 강좌명(3번째 칸)을 뽑는다. 진단용."""
-    soup = BeautifulSoup(html, "html.parser")
+    main = content_soup(html)
     names = []
-    for r in soup.select(".modules_fmcs_lecture tbody tr") or soup.select("tbody tr"):
+    for r in main.select("tbody tr"):
         if r.select_one("td.empty, .nodata_wrap"):
             continue
         tds = r.find_all("td")
@@ -209,60 +138,111 @@ def list_course_names(html: str) -> list:
     return names
 
 
-SEEN = {}  # 탭이름 -> 그 탭에서 본 강좌명 목록 (진단용)
-
-
 def seen_summary() -> str:
     parts = []
-    for tab_name, names in SEEN.items():
-        if names:
-            shown = html_mod.escape(", ".join(names[:6])) + (f" 외 {len(names) - 6}개" if len(names) > 6 else "")
-            parts.append(f"{tab_name} 탭 {len(names)}개: {shown}")
+    for name, val in SEEN.items():
+        if isinstance(val, list):
+            if val:
+                shown = html_mod.escape(", ".join(val[:6]), quote=False) + (f" 외 {len(val) - 6}개" if len(val) > 6 else "")
+                parts.append(f"{name}: {len(val)}개 ({shown})")
+            else:
+                parts.append(f"{name}: 강좌 없음")
         else:
-            parts.append(f"{tab_name} 탭: 강좌 없음")
+            parts.append(f"{name}: {html_mod.escape(str(val), quote=False)}")
     return "\n".join(parts)
 
 
-def find_status_all_tabs():
-    """두 탭(신규접수→접수종료)을 페이지별로 훑어 대상 강좌의 상태를 찾는다.
-    반환: (상태, 탭이름, 행텍스트) 또는 (None, None, 이유)."""
-    last_reason = "목록을 읽지 못했습니다."
-    for code, tab_name in LECTURE_TABS:
-        SEEN[tab_name] = []
-        prev_html = None
-        for page in range(1, MAX_PAGES + 1):
-            url = build_url(code, page)
-            html = fetch_html(url)
-            if DUMP_HTML:
-                for name in (f"page_{code}_{page}.html", "page.html"):
-                    with open(name, "w", encoding="utf-8") as f:
-                        f.write(html)
-            if html == prev_html:
-                print(f"[{tab_name} 탭 {page}페이지] 이전 페이지와 동일, 중단")
-                break
-            prev_html = html
-            SEEN[tab_name].extend(list_course_names(html))
-            status, detail = find_status(html)
-            if status:
-                return status, tab_name, detail
-            if not has_rows(html):
-                print(f"[{tab_name} 탭 {page}페이지] 강좌 행 없음")
-                break
-            print(f"[{tab_name} 탭 {page}페이지] 강좌 있음, 대상 없음")
-            last_reason = detail
-    return None, None, "신규접수/접수종료 탭 어디에도 대상 강좌가 없습니다. " + last_reason
+# ---------- 브라우저로 읽기 ----------
 
+def dump(name: str, html: str, page=None) -> None:
+    if not DUMP_HTML:
+        return
+    with open(f"page_{name}.html", "w", encoding="utf-8") as f:
+        f.write(html)
+    if page is not None:
+        try:
+            page.screenshot(path=f"shot_{name}.png", full_page=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def settle(page) -> None:
+    """자바스크립트로 목록이 채워질 때까지 잠시 기다린다."""
+    try:
+        page.wait_for_load_state("networkidle", timeout=PAGE_TIMEOUT_MS)
+    except Exception:  # noqa: BLE001
+        pass
+    page.wait_for_timeout(1500)
+
+
+def read_status_with_browser():
+    """(상태, 출처, 설명) 또는 (None, None, 이유)."""
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=os.environ.get("CHROMIUM_PATH") or None)
+        context = browser.new_context(
+            user_agent=USER_AGENT,
+            locale="ko-KR",
+            viewport={"width": 412, "height": 915},
+            is_mobile=True,
+        )
+        page = context.new_page()
+        page.set_default_timeout(PAGE_TIMEOUT_MS)
+
+        # 1) 상세 페이지
+        page.goto(DETAIL_URL, wait_until="domcontentloaded")
+        settle(page)
+        html = page.content()
+        dump("detail", html, page)
+        status, detail = find_status_in_detail(html)
+        SEEN["상세 페이지"] = detail if status is None else f"{status}"
+        if status:
+            browser.close()
+            return status, "상세 페이지", detail
+        print(f"[상세 페이지] {detail}")
+
+        # 2) 목록 페이지: 기본 화면 → 신규접수 탭 → 접수종료 탭
+        page.goto(TARGET_URL, wait_until="domcontentloaded")
+        settle(page)
+        html = page.content()
+        dump("list_default", html, page)
+        SEEN["목록(기본)"] = list_course_names(html)
+        status, detail = find_status_in_list(html)
+        if status:
+            browser.close()
+            return status, "목록(기본)", detail
+
+        for code, tab_name in LECTURE_TABS:
+            tab = page.locator(f".list_tab a[data-value='{code}']")
+            if tab.count() == 0:
+                SEEN[f"목록({tab_name})"] = f"탭 버튼을 찾지 못함"
+                continue
+            try:
+                tab.first.click()
+                settle(page)
+            except Exception as e:  # noqa: BLE001
+                SEEN[f"목록({tab_name})"] = f"탭 클릭 실패: {e}"[:120]
+                continue
+            html = page.content()
+            dump(f"list_{code}", html, page)
+            SEEN[f"목록({tab_name})"] = list_course_names(html)
+            status, detail = find_status_in_list(html)
+            if status:
+                browser.close()
+                return status, f"목록({tab_name})", detail
+
+        browser.close()
+    return None, None, "상세 페이지와 목록 어디에서도 강좌 상태를 읽지 못했습니다."
+
+
+# ---------- 알림/상태 ----------
 
 def send_telegram(message: str) -> None:
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     chat_id = os.environ["TELEGRAM_CHAT_ID"]
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
+    payload = {"chat_id": chat_id, "text": message[:4000], "parse_mode": "HTML", "disable_web_page_preview": True}
     r = requests.post(url, json=payload, timeout=30)
     r.raise_for_status()
 
@@ -292,26 +272,24 @@ def main() -> int:
     prev_error = state.get("error")
 
     try:
-        status, tab_name, detail = find_status_all_tabs()
+        status, source, detail = read_status_with_browser()
     except Exception as e:  # noqa: BLE001
-        msg = str(e)
+        msg = f"페이지를 읽는 중 오류: {type(e).__name__}: {str(e)[:300]}"
         print(msg, file=sys.stderr)
-        # 같은 오류를 반복해서 보내지 않는다.
-        if prev_error != msg:
-            send_telegram(f"⚠️ 배드민턴 감시 오류\n{msg}\n{now_kst()}")
-            state.update({"error": msg, "checked_at": now_kst()})
-            save_state(state)
+        if prev_error != msg or FORCE_NOTIFY:
+            send_telegram(f"⚠️ 배드민턴 감시 오류\n{html_mod.escape(msg)}\n{now_kst()}")
+        state.update({"error": msg, "checked_at": now_kst()})
+        save_state(state)
         return 1
 
-    print(f"[{now_kst()}] status={status!r} tab={tab_name!r} detail={detail[:200]!r}")
+    print(f"[{now_kst()}] status={status!r} source={source!r} detail={detail[:200]!r}")
+    print(seen_summary())
 
     extra_lines = []
     if status is None:
-        # 두 탭 모두에 강좌가 없음: 강좌가 목록에서 내려간 상태로 취급하고 변화 시에만 알림
-        status = "목록에 없음"
-        tab_name = "-"
-        extra_lines.append("🔎 현재 보이는 강좌:\n" + seen_summary())
-        print(seen_summary())
+        status = "읽기 실패"
+        source = "-"
+        extra_lines.append("🔎 진단:\n" + seen_summary())
 
     is_open = bool(OPEN_PATTERN.search(status))
     changed = status != prev_status
@@ -326,17 +304,18 @@ def main() -> int:
         lines = [
             head,
             f"강좌: {TARGET_KEYWORD} (월수금 20:30~21:50)",
-            f"상태: <b>{status}</b>" + (f" (이전: {prev_status})" if prev_status and changed else "") + f" · {tab_name} 탭",
+            f"상태: <b>{html_mod.escape(status)}</b>"
+            + (f" (이전: {html_mod.escape(str(prev_status))})" if prev_status and changed else "")
+            + f" · {source}",
             f"시간: {now_kst()}",
             *extra_lines,
-            f'<a href="{TARGET_URL}">👉 예약 페이지 열기</a>',
+            f'<a href="{DETAIL_URL}">👉 강좌 페이지 열기</a>',
         ]
         send_telegram("\n".join(lines))
         print("텔레그램 알림 전송 완료")
 
-    state = {"status": status, "checked_at": now_kst(), "error": None}
-    save_state(state)
-    return 0
+    save_state({"status": status, "checked_at": now_kst(), "error": None})
+    return 0 if status != "읽기 실패" else 1
 
 
 if __name__ == "__main__":
