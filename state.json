@@ -1,5 +1,5 @@
 {
   "status": "마감",
-  "checked_at": "2026-10-14 06:15:24 KST",
-  "error": null
+  "checked_at": "2026-10-14 09:20:45 KST",
+  "error": "페이지를 읽는 중 오류: Error: BrowserType.launch: Executable doesn't exist at /home/runner/.cache/ms-playwright/chromium_headless_shell-1248/chrome-headless-shell-linux64/chrome-headless-shell\n╔════════════════════════════════════════════════════════════╗\n║ Looks like Playwright was just installed or updated.       ║\n║ Please ru"
 }
